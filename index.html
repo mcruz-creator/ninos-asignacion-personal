@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sanatorio de Niños · Asignación de personal</title>
+  <meta name="description" content="Importar personal, asignar centros y validar el cierre mensual de Sanatorio de Niños.">
+  <meta name="robots" content="noindex,nofollow">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e65100'/%3E%3Ctext x='16' y='24' font-size='20' font-weight='bold' fill='white' text-anchor='middle' font-family='sans-serif'%3ESN%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,500..900;1,500..900&family=Hanken+Grotesk:wght@400..700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="styles.css?v=20261013b">
+</head>
+<body>
+  <section id="login" class="login-page">
+    <div class="login-shell">
+      <div class="login-intro">
+        <img class="login-logo" src="assets/logo-sn.webp" width="181" height="93" alt="Sanatorio de Niños">
+        <p class="login-eyebrow">Asignación de personal</p>
+        <h1>Cada persona, repartida entre sus centros <em>al&nbsp;100%</em>, todos los meses.</h1>
+        <p class="login-lede">Cada responsable reparte el tiempo de sus colaboradores entre centros de costos y de beneficio, el responsable de cada centro confirma lo que recibe y RRHH cierra el mes. El resultado alimenta el modelo de costos.</p>
+        <figure class="login-demo" aria-label="Ejemplo: una persona repartida entre dos centros">
+          <figcaption><b>Laura Pérez</b><span>Ejemplo &middot; Septiembre 2026</span></figcaption>
+          <div class="ld-bar"><i class="a" style="width:70%"></i><i class="b" style="width:30%"></i></div>
+          <div class="ld-row"><s class="a"></s><span>Laboratorio</span><b>70%</b></div>
+          <div class="ld-row"><s class="b"></s><span>Imágenes <em>confirmado</em></span><b>30%</b></div>
+          <div class="ld-total"><span>Total</span><b>100%</b></div>
+        </figure>
+      </div>
+      <form id="loginForm" class="login-card">
+        <div class="login-brand">Acceso</div>
+        <h1>Ingresar</h1>
+        <p>Ingresá con tu correo y contraseña. Si todavía no tenés contraseña, pedísela a RRHH o al administrador.</p>
+        <label class="field">Correo electrónico
+          <input id="loginEmail" type="email" autocomplete="email" required placeholder="nombre@organizacion.com">
+        </label>
+        <label class="field">Contraseña
+          <input id="loginPassword" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="btn primary wide" type="submit">Ingresar</button>
+        <div id="loginMessage" class="login-message" aria-live="polite"></div>
+      </form>
+    </div>
+  </section>
+  <div id="secureApp" class="layout" hidden>
+    <aside>
+      <div class="brand"><img src="assets/logo-sn.webp" width="181" height="93" alt="Sanatorio de Niños"><span>Asignación de personal</span></div>
+      <nav id="nav" aria-label="Navegación principal"></nav>
+      <div class="period"><b>Período seleccionado</b><span id="periodAside">—</span></div>
+    </aside>
+    <div class="page">
+      <header>
+        <div><b>Asignación de personal</b><span id="rolePill" class="pill">—</span></div>
+        <div class="header-controls">
+          <label class="profile">Período <input id="periodFilter" type="month" min="2025-01"></label>
+          <span id="signedUser" class="signed-user"></span>
+          <button id="myPassword" class="btn">Contraseña</button>
+          <button id="logout" class="btn">Salir</button>
+        </div>
+      </header>
+      <main id="app"></main>
+    </div>
+  </div>
+  <dialog id="modal"></dialog>
+  <div id="toast" role="status" hidden></div>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="config.js"></script>
+  <script src="jszip.min.js"></script>
+  <script src="app.js?v=20261013b"></script>
+</body>
+</html>
