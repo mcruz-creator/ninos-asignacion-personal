@@ -35,6 +35,26 @@ create table if not exists public.centers (
   sort_order integer not null default 0
 );
 
+-- Un centro puede tener mas de un responsable: el jefe del sector y el jefe de un departamento,
+-- o uno por turno. Cualquiera de ellos confirma las dedicaciones que recibe el centro. Esta tabla es
+-- la unica fuente de verdad; centers.responsible_id queda como titular, solo para mostrar.
+create table if not exists public.center_responsibles (
+  center_id text not null references public.centers(id) on delete cascade,
+  responsible_id uuid not null references public.responsibles(id),
+  added_by text not null default '',
+  added_at timestamptz not null default now(),
+  primary key(center_id, responsible_id)
+);
+
+create index if not exists center_responsibles_by_responsible
+  on public.center_responsibles(responsible_id);
+
+-- Arranca con lo que ya hay cargado: el responsable unico de cada centro pasa a ser el primero de la lista.
+insert into public.center_responsibles(center_id,responsible_id,added_by)
+  select c.id, c.responsible_id, 'migracion' from public.centers c
+  where c.responsible_id is not null
+  on conflict do nothing;
+
 create table if not exists public.people (
   id text primary key,
   name text not null,
@@ -141,6 +161,18 @@ returns boolean language sql stable security definer
 set search_path = public
 as $$ select coalesce(public.current_role() in ('rrhh','administrador'),false) $$;
 
+-- Un centro puede tener varios responsables: alcanza con estar en la lista.
+create or replace function public.center_has_responsible(p_center_id text, p_responsible_id uuid)
+returns boolean language sql stable security definer set search_path=public
+as $$
+  select p_responsible_id is not null and exists(
+    select 1 from public.center_responsibles cr
+    where cr.center_id=p_center_id and cr.responsible_id=p_responsible_id)
+$$;
+
+revoke all on function public.center_has_responsible(text,uuid) from public;
+grant execute on function public.center_has_responsible(text,uuid) to authenticated;
+
 -- Responsable principal de una persona en una fecha, según el historial.
 create or replace function public.responsible_at(p_person_id text, p_date date)
 returns uuid language sql stable security definer set search_path=public
@@ -196,14 +228,15 @@ as $$
     select 1
     from public.assignment_versions v
     join public.assignment_lines l on l.version_id=v.id
-    join public.centers c on c.id=l.center_id
-    where v.person_id=person_key and c.responsible_id=public.current_responsible_id()
+    join public.center_responsibles cr on cr.center_id=l.center_id
+    where v.person_id=person_key and cr.responsible_id=public.current_responsible_id()
   )
 $$;
 
 alter table public.responsibles enable row level security;
 alter table public.app_users enable row level security;
 alter table public.centers enable row level security;
+alter table public.center_responsibles enable row level security;
 alter table public.people enable row level security;
 alter table public.responsible_history enable row level security;
 alter table public.assignment_versions enable row level security;
@@ -231,6 +264,9 @@ drop policy if exists center_read on public.centers;
 create policy center_read on public.centers for select to authenticated using (public.is_active_user());
 drop policy if exists center_manage on public.centers;
 create policy center_manage on public.centers for all to authenticated using (public.is_hr_or_admin()) with check (public.is_hr_or_admin());
+
+drop policy if exists center_resp_read on public.center_responsibles;
+create policy center_resp_read on public.center_responsibles for select to authenticated using (public.is_active_user());
 
 drop policy if exists people_read on public.people;
 create policy people_read on public.people for select to authenticated using (public.can_see_person(id));
@@ -269,6 +305,181 @@ drop policy if exists audit_read on public.audit_events;
 create policy audit_read on public.audit_events for select to authenticated using (public.is_hr_or_admin());
 drop policy if exists audit_insert on public.audit_events;
 create policy audit_insert on public.audit_events for insert to authenticated with check (actor_email=public.current_email() and public.is_active_user());
+
+-- Pedido de transferencia de una persona a otro responsable. Lo origina el responsable principal
+-- y lo resuelve RRHH: la persona sigue a su cargo hasta que se apruebe. Un solo pedido pendiente
+-- por persona. La tabla se lee con RLS y se escribe unicamente por request_transfer,
+-- cancel_transfer y resolve_transfer.
+create table if not exists public.transfer_requests (
+  id uuid primary key default gen_random_uuid(),
+  person_id text not null references public.people(id) on delete cascade,
+  from_responsible_id uuid not null references public.responsibles(id),
+  suggested_responsible_id uuid not null references public.responsibles(id),
+  reason text not null,
+  status text not null default 'pendiente' check (status in ('pendiente','aprobada','rechazada','cancelada')),
+  requested_by text not null,
+  requested_at timestamptz not null default now(),
+  resolved_by text,
+  resolved_at timestamptz,
+  resolution_note text,
+  final_responsible_id uuid references public.responsibles(id),
+  effective_from date
+);
+
+create unique index if not exists transfer_requests_open
+  on public.transfer_requests(person_id) where status='pendiente';
+create index if not exists transfer_requests_from
+  on public.transfer_requests(from_responsible_id);
+
+alter table public.transfer_requests enable row level security;
+
+drop policy if exists transfer_request_read on public.transfer_requests;
+create policy transfer_request_read on public.transfer_requests for select to authenticated
+  using (public.is_hr_or_admin() or from_responsible_id=public.current_responsible_id());
+
+grant select on public.transfer_requests to authenticated;
+grant select on public.center_responsibles to authenticated;
+
+-- El responsable principal pide que una persona deje de estar a su cargo y sugiere, en forma
+-- obligatoria, quien deberia reemplazarlo. No transfiere nada: queda pendiente hasta que RRHH
+-- lo resuelva, y mientras tanto la persona sigue a su cargo y la valida igual.
+create or replace function public.request_transfer(p_person_id text, p_suggested uuid, p_reason text)
+returns uuid language plpgsql security definer set search_path=public
+as $$
+declare
+  v_person public.people;
+  v_reason text := nullif(trim(coalesce(p_reason,'')),'');
+  v_from uuid;
+  v_id uuid;
+begin
+  select * into v_person from public.people where id=p_person_id;
+  if not found then raise exception 'Persona inexistente'; end if;
+  v_from := v_person.responsible_id;
+  if not public.is_hr_or_admin() and v_from is distinct from public.current_responsible_id() then
+    raise exception 'Sólo el responsable principal de esa persona puede pedir la transferencia.';
+  end if;
+  if v_from is null then
+    raise exception 'Esa persona no tiene responsable principal: pedíselo a RRHH.';
+  end if;
+  if v_person.end_date is not null and v_person.end_date < date_trunc('month',now())::date then
+    raise exception 'Esa persona ya está dada de baja.';
+  end if;
+  if v_reason is null then
+    raise exception 'Escribí el motivo: es lo que RRHH va a usar para hablar con el responsable nuevo.';
+  end if;
+  if not exists(select 1 from public.responsibles where id=p_suggested and active) then
+    raise exception 'El responsable sugerido no existe o no está activo.';
+  end if;
+  if p_suggested=v_from then
+    raise exception 'Esa persona ya está a cargo de ese responsable.';
+  end if;
+  if exists(select 1 from public.transfer_requests where person_id=p_person_id and status='pendiente') then
+    raise exception 'Ya hay un pedido de transferencia pendiente para esa persona.';
+  end if;
+  insert into public.transfer_requests(person_id,from_responsible_id,suggested_responsible_id,reason,requested_by)
+    values(p_person_id,v_from,p_suggested,v_reason,public.current_email())
+    returning id into v_id;
+  insert into public.audit_events(actor_email,event_type,description)
+    values(public.current_email(),'transfer_request','Pedido de transferencia de '||v_person.name||' a '||(select name from public.responsibles where id=p_suggested));
+  return v_id;
+end $$;
+
+revoke all on function public.request_transfer(text,uuid,text) from public, anon;
+grant execute on function public.request_transfer(text,uuid,text) to authenticated;
+
+-- Quien origino el pedido lo puede cancelar mientras RRHH no lo haya resuelto.
+create or replace function public.cancel_transfer(p_id uuid)
+returns void language plpgsql security definer set search_path=public
+as $$
+declare v_req public.transfer_requests; v_name text;
+begin
+  select * into v_req from public.transfer_requests where id=p_id for update;
+  if not found then raise exception 'Ese pedido no existe.'; end if;
+  if not public.is_hr_or_admin() and v_req.from_responsible_id is distinct from public.current_responsible_id() then
+    raise exception 'Sólo quien pidió la transferencia puede cancelarla.';
+  end if;
+  if v_req.status<>'pendiente' then raise exception 'Ese pedido ya fue resuelto.'; end if;
+  update public.transfer_requests
+    set status='cancelada', resolved_by=public.current_email(), resolved_at=now()
+    where id=p_id;
+  select name into v_name from public.people where id=v_req.person_id;
+  insert into public.audit_events(actor_email,event_type,description)
+    values(public.current_email(),'transfer_cancel','Pedido de transferencia cancelado: '||coalesce(v_name,v_req.person_id));
+end $$;
+
+revoke all on function public.cancel_transfer(uuid) from public, anon;
+grant execute on function public.cancel_transfer(uuid) to authenticated;
+
+-- RRHH resuelve el pedido. Al aprobar elige a quien pasa (puede no ser el sugerido) y desde que
+-- mes, y la distribucion de centros de la persona se borra desde ese mes: el responsable nuevo la
+-- tiene que rearmar antes de validar. Al rechazar, el motivo es obligatorio y lo ve quien pidio.
+create or replace function public.resolve_transfer(p_id uuid, p_approve boolean, p_final_responsible uuid, p_effective_from date, p_note text)
+returns void language plpgsql security definer set search_path=public
+as $$
+declare
+  v_req public.transfer_requests;
+  v_person public.people;
+  v_final uuid;
+  v_from date;
+  v_note text := nullif(trim(coalesce(p_note,'')),'');
+begin
+  if not public.is_hr_or_admin() then
+    raise exception 'Sólo RRHH o el administrador pueden resolver una transferencia.';
+  end if;
+  select * into v_req from public.transfer_requests where id=p_id for update;
+  if not found then raise exception 'Ese pedido no existe.'; end if;
+  if v_req.status<>'pendiente' then raise exception 'Ese pedido ya fue resuelto.'; end if;
+  select * into v_person from public.people where id=v_req.person_id for update;
+  if not found then raise exception 'Persona inexistente'; end if;
+
+  if not p_approve then
+    if v_note is null then
+      raise exception 'Escribí el motivo del rechazo: el responsable lo va a ver en la app.';
+    end if;
+    update public.transfer_requests
+      set status='rechazada', resolved_by=public.current_email(), resolved_at=now(), resolution_note=v_note
+      where id=p_id;
+    insert into public.audit_events(actor_email,event_type,description)
+      values(public.current_email(),'transfer_reject','Transferencia rechazada: '||v_person.name||' sigue a cargo de '||(select name from public.responsibles where id=v_req.from_responsible_id));
+    return;
+  end if;
+
+  v_final := coalesce(p_final_responsible, v_req.suggested_responsible_id);
+  if p_effective_from is null then
+    raise exception 'Indicá desde qué mes toma efecto la transferencia.';
+  end if;
+  v_from := greatest(date_trunc('month',p_effective_from)::date, v_person.start_date);
+  if not exists(select 1 from public.responsibles where id=v_final and active) then
+    raise exception 'El responsable elegido no existe o no está activo. Elegí otro.';
+  end if;
+  if v_person.end_date is not null and v_from>v_person.end_date then
+    raise exception 'La persona ya estaba de baja en %.', to_char(v_from,'MM/YYYY');
+  end if;
+  perform public.assert_open(v_from, null);
+
+  -- La distribución de centros se corta en el mes efectivo y lo que viene después se borra:
+  -- las líneas y las confirmaciones cuelgan de la versión con on delete cascade, así que el
+  -- responsable nuevo arranca sin reparto y la app le muestra "Falta completar".
+  update public.assignment_versions set valid_to=v_from-1
+    where person_id=v_req.person_id and valid_from<v_from and (valid_to is null or valid_to>=v_from);
+  delete from public.assignment_versions
+    where person_id=v_req.person_id and valid_from>=v_from;
+
+  -- change_responsible controla la persona y el responsable, actualiza el historial y, por su
+  -- trigger, reinicia la validación mensual del responsable viejo y del nuevo desde el mes efectivo.
+  perform public.change_responsible(v_req.person_id, v_from, v_final,
+    'Transferencia aprobada por RRHH (pedida por '||v_req.requested_by||')');
+
+  update public.transfer_requests
+    set status='aprobada', resolved_by=public.current_email(), resolved_at=now(),
+        resolution_note=v_note, final_responsible_id=v_final, effective_from=v_from
+    where id=p_id;
+  insert into public.audit_events(actor_email,event_type,description)
+    values(public.current_email(),'transfer_approve','Transferencia aprobada: '||v_person.name||' pasa a '||(select name from public.responsibles where id=v_final)||' desde '||to_char(v_from,'MM/YYYY')||'; se borró su distribución de centros');
+end $$;
+
+revoke all on function public.resolve_transfer(uuid,boolean,uuid,date,text) from public, anon;
+grant execute on function public.resolve_transfer(uuid,boolean,uuid,date,text) to authenticated;
 
 -- Guarda la asignación desde un mes. Rige hasta la próxima versión o hasta que la persona cambie de
 -- responsable. No hace nada si no hay cambios; si los hay, sólo reinicia la validación de los
@@ -326,11 +537,11 @@ begin
     order by valid_from desc limit 1;
 
   -- Centros cuyo porcentaje cambia (incluye los que se agregan o se quitan).
-  select coalesce(array_agg(distinct c.responsible_id) filter (where c.responsible_id is not null),'{}') into v_affected
+  select coalesce(array_agg(distinct cr.responsible_id),'{}') into v_affected
   from (select center_id, pct from public.assignment_lines where version_id=v_prev) o
   full join (select x->>'center_id' center_id, round((x->>'pct')::numeric,4) pct from jsonb_array_elements(p_lines) x) n
     on n.center_id=o.center_id
-  join public.centers c on c.id=coalesce(n.center_id,o.center_id)
+  join public.center_responsibles cr on cr.center_id=coalesce(n.center_id,o.center_id)
   where o.pct is distinct from n.pct;
   if v_prev is not null and not exists(
     select 1
@@ -456,8 +667,10 @@ begin
     join public.assignment_lines l on l.version_id=v.id
     join public.centers c on c.id=l.center_id
     where p.start_date<=v_end and (p.end_date is null or p.end_date>=v_month)
-      and ((o.owner=v_rid and c.responsible_id is not null and c.responsible_id<>v_rid)
-        or (o.owner<>v_rid and c.responsible_id=v_rid))
+      -- Propias en un centro de otro (espera su confirmacion), y ajenas en un centro mio (la tengo que confirmar).
+      and ((o.owner=v_rid and not public.center_has_responsible(c.id,v_rid)
+            and exists(select 1 from public.center_responsibles cr where cr.center_id=c.id))
+        or (o.owner<>v_rid and public.center_has_responsible(c.id,v_rid)))
       and not public.shared_confirmed(p.id,c.id,v.id,v_month)
   ) then raise exception 'Hay dedicaciones compartidas sin confirmar'; end if;
   insert into public.monthly_validations(period,responsible_id,validated_by)
@@ -478,6 +691,7 @@ begin
   delete from public.hr_validations where true;
   delete from public.monthly_validations where true;
   delete from public.shared_confirmations where true;
+  delete from public.center_responsibles where true;
   update public.centers set responsible_id=null where responsible_id is not null;
   delete from public.app_users where role='responsable';
   delete from public.people where true;
@@ -523,9 +737,9 @@ begin
       and (mv.responsible_id=new.responsible_id
         or mv.responsible_id in (select h.responsible_id from public.responsible_history h where h.person_id=new.id)
         or mv.responsible_id in (
-          select c.responsible_id from public.assignment_versions v
+          select cr.responsible_id from public.assignment_versions v
           join public.assignment_lines l on l.version_id=v.id
-          join public.centers c on c.id=l.center_id
+          join public.center_responsibles cr on cr.center_id=l.center_id
           where v.person_id=new.id));
   return new;
 end $$;
@@ -534,34 +748,38 @@ drop trigger if exists people_invalidate_control on public.people;
 create trigger people_invalidate_control before insert or update of start_date,end_date on public.people
 for each row execute function public.invalidate_people_control();
 
--- Cambiar el responsable de un centro: las confirmaciones anteriores quedan para los meses cerrados;
--- en los abiertos debe confirmar el nuevo responsable. Se reinician las validaciones abiertas afectadas.
-create or replace function public.invalidate_center_control()
+-- Sacar un responsable de un centro deja en duda lo que ya estaba confirmado: en los meses abiertos
+-- las confirmaciones de ese centro se piden de nuevo y se reinician las validaciones involucradas.
+-- Agregar un responsable no invalida nada, porque nadie pierde permisos sobre lo ya confirmado.
+create or replace function public.center_responsible_removed()
 returns trigger language plpgsql security definer set search_path=public
 as $$
 begin
-  if old.responsible_id is distinct from new.responsible_id then
-    new.responsible_since := now();
-    delete from public.monthly_validations mv
-      where mv.period not in (select hv.period from public.hr_validations hv)
-        and (mv.responsible_id in (old.responsible_id,new.responsible_id)
-          or mv.responsible_id in (
-            select p.responsible_id from public.assignment_lines l
-            join public.assignment_versions v on v.id=l.version_id
-            join public.people p on p.id=v.person_id
-            where l.center_id=new.id)
-          or mv.responsible_id in (
-            select h.responsible_id from public.assignment_lines l
-            join public.assignment_versions v on v.id=l.version_id
-            join public.responsible_history h on h.person_id=v.person_id
-            where l.center_id=new.id));
-  end if;
-  return new;
+  update public.centers set responsible_since=now() where id=old.center_id;
+  delete from public.monthly_validations mv
+    where mv.period not in (select hv.period from public.hr_validations hv)
+      and (mv.responsible_id=old.responsible_id
+        or mv.responsible_id in (
+          select cr.responsible_id from public.center_responsibles cr where cr.center_id=old.center_id)
+        or mv.responsible_id in (
+          select p.responsible_id from public.assignment_lines l
+          join public.assignment_versions v on v.id=l.version_id
+          join public.people p on p.id=v.person_id
+          where l.center_id=old.center_id)
+        or mv.responsible_id in (
+          select h.responsible_id from public.assignment_lines l
+          join public.assignment_versions v on v.id=l.version_id
+          join public.responsible_history h on h.person_id=v.person_id
+          where l.center_id=old.center_id));
+  return old;
 end $$;
 
+-- La invalidacion vivia en un trigger sobre centers.responsible_id; ahora vive sobre la lista.
 drop trigger if exists center_invalidate_control on public.centers;
-create trigger center_invalidate_control before update of responsible_id on public.centers
-for each row execute function public.invalidate_center_control();
+drop function if exists public.invalidate_center_control();
+drop trigger if exists center_responsible_removed on public.center_responsibles;
+create trigger center_responsible_removed after delete on public.center_responsibles
+for each row execute function public.center_responsible_removed();
 
 -- Cambios en el historial de responsables: se rechazan si alcanzan un mes cerrado y reinician la
 -- validación del responsable anterior y del nuevo en los meses alcanzados.
@@ -679,7 +897,70 @@ end $$;
 revoke all on function public.change_responsible(text,date,uuid,text) from public;
 grant execute on function public.change_responsible(text,date,uuid,text) to authenticated;
 
--- Confirmación de una dedicación recibida para el mes (sólo el responsable del centro, RRHH o administrador).
+-- Unica puerta de escritura de la lista de responsables de un centro.
+create or replace function public.set_center_responsibles(p_center_id text, p_responsibles uuid[])
+returns void language plpgsql security definer set search_path=public
+as $$
+declare
+  v_ids uuid[] := coalesce(p_responsibles,'{}');
+  v_center public.centers;
+  v_names text;
+begin
+  if not public.is_hr_or_admin() then
+    raise exception 'Solo RRHH o el administrador pueden cambiar los responsables de un centro.';
+  end if;
+  select * into v_center from public.centers where id=p_center_id;
+  if not found then raise exception 'Centro inexistente'; end if;
+  if exists(select 1 from unnest(v_ids) x
+            where not exists(select 1 from public.responsibles r where r.id=x and r.active)) then
+    raise exception 'Alguno de los responsables elegidos no existe o esta dado de baja.';
+  end if;
+
+  -- El trigger de borrado es el que reinicia confirmaciones y validaciones de los meses abiertos.
+  delete from public.center_responsibles cr
+    where cr.center_id=p_center_id and not (cr.responsible_id = any(v_ids));
+  insert into public.center_responsibles(center_id,responsible_id,added_by)
+    select p_center_id, x, public.current_email() from unnest(v_ids) x
+    on conflict do nothing;
+
+  -- Titular: el primero de la lista. No lo lee la logica, queda para el listado de Centros.
+  update public.centers set responsible_id=v_ids[1]
+    where id=p_center_id and responsible_id is distinct from v_ids[1];
+
+  select string_agg(r.name,', ' order by r.name) into v_names
+    from public.center_responsibles cr
+    join public.responsibles r on r.id=cr.responsible_id
+    where cr.center_id=p_center_id;
+  insert into public.audit_events(actor_email,event_type,description)
+    values(public.current_email(),'center_owner',
+      'Responsables de '||v_center.name||': '||coalesce(v_names,'sin responsable'));
+end $$;
+
+revoke all on function public.set_center_responsibles(text,uuid[]) from public, anon;
+grant execute on function public.set_center_responsibles(text,uuid[]) to authenticated;
+
+-- Baja o eliminacion de un responsable: lo saca de todos los centros de una sola vez.
+create or replace function public.remove_responsible_from_centers(p_responsible_id uuid)
+returns integer language plpgsql security definer set search_path=public
+as $$
+declare v_n integer;
+begin
+  if not public.is_hr_or_admin() then
+    raise exception 'Solo RRHH o el administrador pueden cambiar los responsables de un centro.';
+  end if;
+  delete from public.center_responsibles where responsible_id=p_responsible_id;
+  get diagnostics v_n = row_count;
+  update public.centers c set responsible_id=(
+      select cr.responsible_id from public.center_responsibles cr
+      where cr.center_id=c.id order by cr.added_at, cr.responsible_id limit 1)
+    where c.responsible_id=p_responsible_id;
+  return v_n;
+end $$;
+
+revoke all on function public.remove_responsible_from_centers(uuid) from public, anon;
+grant execute on function public.remove_responsible_from_centers(uuid) to authenticated;
+
+-- Confirmación de una dedicación recibida para el mes (cualquier responsable del centro, RRHH o administrador).
 create or replace function public.confirm_shared(p_period date, p_person_id text, p_center_id text)
 returns void language plpgsql security definer set search_path=public
 as $$
@@ -692,8 +973,8 @@ declare
 begin
   select * into v_center from public.centers where id=p_center_id;
   if not found then raise exception 'Centro inexistente'; end if;
-  if not public.is_hr_or_admin() and v_center.responsible_id is distinct from public.current_responsible_id() then
-    raise exception 'Sólo el responsable del centro puede confirmar esta dedicación';
+  if not public.is_hr_or_admin() and not public.center_has_responsible(p_center_id,public.current_responsible_id()) then
+    raise exception 'Sólo un responsable del centro puede confirmar esta dedicación';
   end if;
   perform public.assert_open(v_month, v_month);
   select * into v_person from public.people where id=p_person_id;
@@ -718,7 +999,8 @@ end $$;
 revoke all on function public.confirm_shared(date,text,text) from public;
 grant execute on function public.confirm_shared(date,text,text) to authenticated;
 
--- RRHH valida la nómina y cierra el mes. Requiere que todos los responsables del mes hayan validado.
+-- RRHH valida la nómina y cierra el mes. Validan todos los que tienen gente a cargo; de cada centro
+-- usado alcanza con que valide uno de sus responsables.
 create or replace function public.close_month(p_period date)
 returns void language plpgsql security definer set search_path=public
 as $$
@@ -738,17 +1020,27 @@ begin
       where v.person_id=a.id and v.valid_from<=a.d and (v.valid_to is null or v.valid_to>=a.d)
       order by v.valid_from desc limit 1) vid
     from act a
-  ), reps as (
-    select public.responsible_at(ver.id,ver.d) rid from ver
-    union
-    select c.responsible_id from ver
+  ), used as (
+    select distinct l.center_id from ver
     join public.assignment_lines l on l.version_id=ver.vid
-    join public.centers c on c.id=l.center_id
-    where c.responsible_id is not null
+  ), pend as (
+    -- Todo responsable con gente a cargo tiene que validar el mes.
+    select r.name from ver
+    join public.responsibles r on r.id=public.responsible_at(ver.id,ver.d) and r.active
+    where not exists(select 1 from public.monthly_validations mv
+                     where mv.period=v_month and mv.responsible_id=r.id)
+    union
+    -- De cada centro usado alcanza con que valide uno de sus responsables.
+    select r.name from used u
+    join public.center_responsibles cr on cr.center_id=u.center_id
+    join public.responsibles r on r.id=cr.responsible_id and r.active
+    where not exists(
+      select 1 from public.center_responsibles cr2
+      join public.responsibles r2 on r2.id=cr2.responsible_id and r2.active
+      join public.monthly_validations mv on mv.period=v_month and mv.responsible_id=cr2.responsible_id
+      where cr2.center_id=u.center_id)
   )
-  select string_agg(r.name,', ' order by r.name) into v_pending
-  from reps join public.responsibles r on r.id=reps.rid and r.active
-  where not exists(select 1 from public.monthly_validations mv where mv.period=v_month and mv.responsible_id=reps.rid);
+  select string_agg(name,', ' order by name) into v_pending from pend;
   if v_pending is not null then
     raise exception 'Todavía no validaron el mes: %', v_pending;
   end if;
@@ -874,7 +1166,7 @@ update public.app_users set must_change_password=true where password_set_at is n
 -- pantalla Centros una vez autenticado y queda almacenado únicamente en Supabase.
 
 do $$
-declare first_admin text := lower('REEMPLAZAR_CON_TU_EMAIL');
+declare first_admin text := lower('mcruz@grupoorono.com.ar');
 begin
   if first_admin='reemplazar_con_tu_email' then
     raise exception 'Reemplazá REEMPLAZAR_CON_TU_EMAIL por tu correo antes de ejecutar';
